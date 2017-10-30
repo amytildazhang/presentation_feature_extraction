@@ -19,6 +19,8 @@ knitr::opts_chunk$set(echo = TRUE, eval = FALSE, cache = TRUE)
 
 My part of the project involves using established stylometry techniques, as given by Narayanan et al [-@narayanan2012feasibility], to identify authors in Reddit comment data. This involves three main steps: pulling out features from the raw JSON data into a usable format, exploratory data analysis to begin addressing the question of whether these features are useful for identifying authors, and application of classifiers using the features (nearest neighbors and logistic regression). This overview covers the first step.
 
+The `.bz2` file with Reddit comment JSON is too large to put on GitHub, but it is publically available [here](https://www.reddit.com/r/datasets/comments/65o7py/updated_reddit_comment_dataset_as_torrents/).
+
 # Feature extraction
 
 The features we're interested in pulling out are:
