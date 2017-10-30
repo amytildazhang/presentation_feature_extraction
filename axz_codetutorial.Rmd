@@ -17,7 +17,7 @@ knitr::opts_chunk$set(echo = TRUE, eval = FALSE, cache = TRUE)
 
 # Project chunk introduction
 
-My part of the project involves using established stylometry techniques, as given by Narayanan et al [-@narayanan2012feasibility], to identify authors in Reddit comment data. This involves three main steps: pulling out features from the raw JSON data into a usable format, exploratory data analysis to begin addressing the question of whether these features are useful for identifying authors, and application of classifiers using the features (nearest neighbors and logistic regression). This overview covers the first two steps.
+My part of the project involves using established stylometry techniques, as given by Narayanan et al [-@narayanan2012feasibility], to identify authors in Reddit comment data. This involves three main steps: pulling out features from the raw JSON data into a usable format, exploratory data analysis to begin addressing the question of whether these features are useful for identifying authors, and application of classifiers using the features (nearest neighbors and logistic regression). This overview covers the first step.
 
 # Feature extraction
 
@@ -88,7 +88,7 @@ The extracted metadata will be saved in a CSV file with columns like below:
 ```{r eval = TRUE, message = FALSE, warning=FALSE}
 #r code
 library(tidyverse)
-metadata <- read_csv("../Data/RC_2017-02_metadata.csv",
+metadata <- read_csv("RC_2017-02_metadata.csv",
                      col_types = "cccciiciiiiic")
 knitr::kable(metadata[1:10,])
 ```
@@ -143,7 +143,7 @@ The CSV file for textual features will look something like this (truncated to fi
 #r code
 library(tidyverse)
 library(kableExtra)
-features <- read_csv("../Data/RC_2017-02_features.csv")
+features <- read_csv("RC_2017-02_features.csv")
 knitr::kable(features[1:10,], "html") %>%
     kable_styling() %>%
     scroll_box(width = "800px")
@@ -171,7 +171,7 @@ Define column names for our output CSV file
 ```{python}
 def extract_text_features(sourcefile, subreddits = None):
     #read in a list of function words
-	function_words = set(open("../Data/function_words.txt", 'r').read().split('\n'))
+	function_words = set(open("function_words.txt", 'r').read().split('\n'))
     
     #create column names for CSV file
     #many of these pull double duty as the column names and the actual features
@@ -345,292 +345,8 @@ Then I create the PBS script which calls the Python file and provides it with th
 
 cd $PBS_O_WORKDIR
 module load python
-python stylometry_features.py ../Data/RC_2017-02.bz2 nfl falcons patriots nflstreams nflnoobs
+python stylometry_features.py RC_2017-02.bz2 nfl falcons patriots nflstreams nflnoobs
 ```
-
-# Feature EDA
-
-Main goals:
-
-- Look for any odd inconsistencies in features
-
-- Look for how "informative" a feature is
-
-    - Calculate information gain for all features
-    
-    - Plot feature distribution of feature across authors and subreddits
-
-This is all done in R.
-
-![Example of feature distribution plot](../Output/EDA_subreddits_lego_1.png)
-
-
-## Read in data and pull out comments of interest
-
-I want the EDA to follow our research question, so I want to compare all of our features to those that are in our training set, and only use authors in the training set. For now the training set is the subreddit `/r/NFL`.
-
-I use the [tidyverse](https://www.tidyverse.org) and, in particular, [dplyr](http://dplyr.tidyverse.org/articles/dplyr.html) very heavily. It makes coding in R much smoother.
-
-```{r}
-#the ACI doesn't recognize the "tidyverse" wrapper package so load each package separately
-library(readr)
-library(dplyr)
-library(lubridate)
-library(tidyr)
-library(ggplot2)
-library(purrr)
-library(magrittr)
-library(binr)
-
-file <- "../Data/RC_2017-02" #hardcode file we're using because I was being lazy
-allowed_gap <- 60*60*24*3 #comment scores are considered reliable if the comment was collected after allowed_gap
-
-main_subreddit <- "nfl" #set training subreddit
-options(tibble.print_max = Inf) 
-```
-
-Read in the metadata, and filter out authors that
-
-- did not post in the main subreddit `/r/NFL`
-
-- did not post in at least two of the subreddits in the metadata file
-
-I then save these to a CSV file, mostly as a just-in-case measure.
-
-```{r}
-metadata <- read_csv(paste0(file, "_metadata.csv"),
-                     col_types = "cccciiciiiiic") 
-
-subreddits <- unique(metadata$subreddit)
-
-#ID authors that are in the main subreddit and at least one of the others
-authors <- metadata %>%
-    group_by(author) %>%
-    summarise(
-        in_main = main_subreddit %in% subreddit,
-        in_others = any(setdiff(subreddits, main_subreddit) %in% subreddit),
-        subreddits = paste(unique(subreddit), collapse = " "), #record which subreddits
-        n_posts = n() #record total number of posts
-    ) %>%
-    filter(in_main, in_others) %>%
-    arrange(desc(n_posts)) %T>% # %T>% returns the object to the left of the pipe
-    write_csv(paste0(file, "_shared_authors.csv"))
-
-#filter metadata so it only contains the ID'ed authors
-metadata <- filter(metadata, author %in% authors$author)
-```
-
-Then read in the `features` CSV file and filter so that it contains only the comments that are also in the `metadata` dataframe.
-
-```{r}
-features <- read_csv(paste0(file, "_features.csv")) %>%
-    filter(id %in% metadata$id) 
-```
-
-We're going to be looping over all of the features very frequently, so it's useful to separate feature columns in the features dataframe from metadata columns.
-
-```{r}
-id_cols <- c("id", "subreddit_id", "author", "plot", "subreddit")
-feature_cols <- colnames(features) %>% setdiff(id_cols)
-```
-
-For simplicity when creating the `features` CSV file, I left features empty instead of setting them to 0. So now it's time to add the 0s back in. 
-
-```{r}
-#replace all NAs in feature_cols with 0s
-#replace_na() function requires a list where the name is the column and value is what
-#to replace NA values with. So first create the list
-toreplace <- setNames(lapply(vector("list", length(feature_cols)), 
-    function(x) x <- 0), feature_cols)
-#call replace_na
-features <- features %>% 
-    replace_na(toreplace) 
-```
-
-## Calculate information gain of features
-
-Information gain (IG) is defined as 
-
-$$ IG(F_i) = H(B) - H(B|F_i) = H(B) + H(F_i) - H(B,F_i) $$
-
-where $$H(A,B) = - \sum_{\omega} p_{\omega} \log_2{p_{\omega}}$$
-
-- $$\omega = \{ab: a \in A, b \in B\}$$
-
-- $$p_{\omega} = \text{prob of } \omega \text{ occurring}$$
-
-[@lin1991divergence, @narayanan2012feasibility]
-
-Realistically we would only have information gain over our training set. So create a separate dataframe that is our training set (and to make things easier later, create a new column called `plot` that is an indicator for whether that row will be plotted in the EDA later).
-
-```{r}
-plotprob <- min(30000/nrow(metadata), 1) #maximum number of points that can reasonably be plotted
-message("% of points that will be plotted is", plotprob, "\n")
-
-training_set <- features %>% 
-    filter(subreddit %in% main_subreddit) %>%
-    group_by(author) %>%
-    mutate(
-        plot = rbinom(1, n(), plotprob)
-    ) %>%
-    ungroup()
-
-features <- features %>%
-mutate(
-    plot = rbinom(1, n(), plotprob)
-    )
-```
-
-Define functions to help calculate information gain across all 100+ features.
-
-- `shannon_bin`: given the column index of the feature, `ftidx`, within the dataframe `df`, create an ordinal categorical variable with at most 20 bins. Return the categorical variable along with the `id` column in the dataframe. 
-
-- `shannon_entropy`: Given a vector containing instances of a categorical variable, calculate the Shannon entropy.
-
-- `info_gain`: Given the column index of the feature, `ftidx`, within the dataframe `df`, calculate information gain using `shannon_bin` and `shannon_entropy`.
-
-```{r}
-
-shannon_bin <- function(ftidx, df) {
-    ft <- as.numeric(df %>% pull(ftidx)) #pull returns a vector instead of a tibble
-    if (length(unique(ft)) == 1) return(df %>% select(id, ftidx))
-
-    bins <-  bins(ft, 20, max.breaks = 20) #create bins
-    newdf <- df %>% select(ftidx, id) %>% #rearranging df by the feature
-        arrange(df[[ftidx]]) %>%
-        mutate(bin = NA) %>%
-        select(-1) 
-    
-    #given number of items in each bin, assign bins
-    j = 0 
-    letter = 1
-    for (i in bins$binct) {
-        newdf$bin[j:(j+i)] <- letters[letter] 
-        letter <- letter + 1; j <- j + i
-    }
-
-    colnames(newdf)[2] <- colnames(df)[ftidx] #rename ordinal categorical variable to same as feature
-    return(newdf)
-}
-
-shannon_entropy <- function(fct) {
-    occurrence <- table(fct) + .01
-    prob <- occurrence/sum(occurrence)
-    - sum(prob * log2(prob))
-}
-
-#Takes: Dataframe and the column index of the feature of interest within the dataframe
-#Calculates information gain across authors, so it needs a group column named 'author'
-#Tbl manipulation means an 'id' column so that we can match numbers together is necessary
-#returns: scalar value of information gain for that column
-info_gain <- function(ftidx, df) {
-    fctorized <- shannon_bin(ftidx, df) %>%
-        full_join(df %>% select(author, id), by = "id") 
-
-    shannon_entropy(fctorized %>% pull(2)) + 
-    shannon_entropy(fctorized %>% pull(author)) -
-    shannon_entropy(interaction(fctorized %>% pull(2), fctorized %>% pull(author)))
-}
-```
-
-Then we loop over all feature columns, calculate their information gain, and store the results in a dataframe. The dataframe is saved to a CSV file, again as a just-in-case measure.
-
-```{r}
-message("Calculating information gain of feature in column 'x' of the training subreddit: \n")
-#calculate information gain for all columns specified as feature_cols, save as CSV file 
-feature_infogain <- tibble(
-    idx = which(colnames(training_set) %in% feature_cols),
-    info_gain = map_dbl(idx, function(ftidx) info_gain(ftidx, training_set)),
-    feature = feature_cols[idx],
-    n_unique = map_dbl(idx, function(ftidx) features %>% pull(ftidx) %>% unique %>% length)
-    )  %>%
-    arrange(desc(info_gain)) %T>%
-    write_csv(paste0(file, "_feature_infogain.csv"))
-```
-
-## Plot graphs
-
-To make the graphs neater, for each feature graph, sort the authors based on the average value of that feature within their comments. Then we first need to create a dataframe with average feature values across authors.
-
-
-```{r}
-#------------------------------EDA
-#compare feature distribution across authors, and across subreddits
-#provides support that features help distinguish authors and also transfer across subreddits
-
-#dataframe that calculates mean value of all feature_cols, grouped by author
-authorsumm <- training_set %>% 
-    group_by(author) %>%
-    summarise_at(feature_cols, mean, na.rm = TRUE) %>%
-    ungroup()
-
-```
-
-Loop across features and plot comparison of distribution of features across authors and subreddits. This helps us investigate whether the features are topic-independent in our dataset.
-
-```{r}
-for (i in 1:20) { 
-    #save plots of the top 20 features according to information gain
-    message(i) #in case an error occurs, easy way to know which feature is causing the error
-    ft <- feature_infogain$feature[i]
-  
-    #sort authors so they are in ascending order based on their mean valuefor feature of interest
-    #create index for the authors called `order` 
-    authorsumm <- authorsumm %>% arrange_(ft) %>% mutate(order = 1:n())
- 
-    #merge `order` index with features df so authors are plotted in the correct order
-    features <- features %>% left_join(authorsumm %>% select(author, order), by = "author")
-    
-    #calculate average feature value for authors in other subreddits
-    subredditsumm <- features %>%
-        group_by(author, subreddit, order) %>%
-        summarise_at(feature_cols, mean, na.rm = TRUE) %>%
-        ungroup()
-
-    #plot
-    ggplot() +
-        #plot values of feature indicated by `plot` column
-        geom_point(data = features %>% filter(plot != 0), 
-            aes_string(x = "order", y = ft),
-                   alpha = 0.1, size = 1) +
-        #plot gold line that gives average value of feature in training set
-        geom_line(data = subredditsumm, aes_string(x = "order", y = ft),
-                  color = "#0980B2",  size = 0.8) +
-        #plot blue line that gives average value of feature in other subreddits
-        geom_line(data = authorsumm, aes_string(x = "order", y = ft),
-                  color = "#C4A20A", size = 0.8) +
-        theme_minimal() +
-        labs(title = paste("Distribution of", ft, "across subreddits and users"),
-             xlab = "Reddit user id #",
-             ylab = ft) +
-        #split plot into subreddits
-        facet_grid(subreddit ~ ., scales = "free_y") +
-        #save to `Output` folder
-        ggsave(paste0("../Output/EDA_subreddits_", ft, ".png"),
-            height = 10, width = 7, units = "in")
-
-    # clean-up, since we merge on `order` in each loop, need to remove `order` at the end  of every loop
-    features <- features %>% select(-order)
-}
-```
-
-
-## Running on ACI
-
-```{bash}
-#!/bin/bash
-#PBS -l nodes=1:ppn=1
-#PBS -l walltime=24:00:00
-#PBS -l mem=1gb
-#PBS -M akz5056@psu.edu
-#PBS -m abe
-#PBS -A open
-
-cd $PBS_O_WORKDIR
-module load r/3.4
-R CMD BATCH feature_EDA.R
-```
-
 
 # Settings for this R Markdown file
 
