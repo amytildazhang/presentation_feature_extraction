@@ -486,7 +486,7 @@ knitr<span class="op">::</span><span class="kw">kable</span>(metadata[<span clas
 <div class="sourceCode"><pre class="sourceCode r"><code class="sourceCode r"><span class="co">#r code</span>
 <span class="kw">library</span>(tidyverse)
 <span class="kw">library</span>(kableExtra)
-features &lt;-<span class="st"> </span><span class="kw">read_csv</span>(<span class="st">&quot;RC_2017-02_features_first1e5.csv&quot;</span>)
+features &lt;-<span class="st"> </span><span class="kw">read_csv</span>(<span class="st">&quot;RC_2017-02_features_first1e4.csv&quot;</span>)
 knitr<span class="op">::</span><span class="kw">kable</span>(features[<span class="dv">1</span><span class="op">:</span><span class="dv">10</span>,], <span class="st">&quot;html&quot;</span>) <span class="op">%&gt;%</span>
 <span class="st">    </span><span class="kw">kable_styling</span>() <span class="op">%&gt;%</span>
 <span class="st">    </span><span class="kw">scroll_box</span>(<span class="dt">width =</span> <span class="st">&quot;800px&quot;</span>)</code></pre></div>
@@ -11521,6 +11521,9 @@ NA
 <span class="bu">cd</span> <span class="va">$PBS_O_WORKDIR</span>
 <span class="ex">module</span> load python
 <span class="ex">python</span> stylometry_features.py RC_2017-02.bz2 nfl falcons patriots nflstreams nflnoobs</code></pre></div>
+<p>The ACI may not have all of the Python libraries in the scirpt installed. To install them, in either ACI-I or ACI-B, type in the shell:</p>
+<div class="sourceCode"><pre class="sourceCode python"><code class="sourceCode python">module load python
+pip install libraryname <span class="op">--</span>user <span class="op">--</span>upgrade</code></pre></div>
 </div>
 </div>
 <div id="settings-for-this-r-markdown-file" class="section level1">

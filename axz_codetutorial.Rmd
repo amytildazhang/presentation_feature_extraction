@@ -350,6 +350,14 @@ module load python
 python stylometry_features.py RC_2017-02.bz2 nfl falcons patriots nflstreams nflnoobs
 ```
 
+The ACI may not have all of the Python libraries in the scirpt installed. To install them, in either ACI-I or ACI-B, type in the shell:
+
+```{python}
+module load python
+pip install libraryname --user --upgrade
+```
+
+
 # Settings for this R Markdown file
 
 
