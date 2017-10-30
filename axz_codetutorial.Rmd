@@ -1,0 +1,654 @@
+---
+title: "Code overview"
+author: "Amy Zhang"
+date: "10/25/2017"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: zenburn 
+bibliography: axz_codebib.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, cache = TRUE)
+```
+
+# Project chunk introduction
+
+My part of the project involves using established stylometry techniques, as given by Narayanan et al [-@narayanan2012feasibility], to identify authors in Reddit comment data. This involves three main steps: pulling out features from the raw JSON data into a usable format, exploratory data analysis to begin addressing the question of whether these features are useful for identifying authors, and application of classifiers using the features (nearest neighbors and logistic regression). This overview covers the first two steps.
+
+# Feature extraction
+
+The features we're interested in pulling out are:
+
+- Number of words in each post
+
+- Number of characters in each post
+
+- Vocabulary richness: Yule's K, hapax legomena, dis legomena, etc.
+
+- Word shape: all caps, no caps, first letter upper case, camel case, and other
+
+- Frequency of words that have 1-20 characters
+
+- Frequency of a to z, 0 to 9, ignoring case
+
+- Frequency of punctuation .?!,;:()"-'
+
+- Frequency of special characters \`~@#$%^&*_+=[]{}\\|/<>
+
+- Frequency of words like 'the', 'of', 'and' (function words)
+
+- Syntactic category pairs (done by Michelle)
+
+- Comment metadata such as the time it was created, its score, its position in the comment chain
+
+## Setting up the Python script
+
+Workflow:
+
+- Given path to `bz2` zipped file of raw JSON data, create path to output CSV file
+
+- Create `csv.DictWriter()` for the output CSV file
+
+    - Define convenient column names to pass to the DictWriter
+
+- Read through `bz2` file line by line. For each line:
+
+    - Extract metadata or textual features
+    
+    - Save to the output CSV file
+
+This has the advantage of putting next to no strain on your RAM and, since the code is the same for each line, can be parallelized fairly easily (though I didn't do that). The disadvantage is that it is a lot of read/write operations. All Python code is in Python 3.
+
+The files we are dealing with are very large, even zipped using `bz2` they are 8Gb, so I chose to separate feature extraction into metadata and extraction of textual features, leading to two separate functions:
+
+- `extract_metadata(sourcefile, subreddits)`
+
+- `extract_text_features(sourcefile, subreddits)`
+
+Each of these take in the `sourcefile` with the raw JSON and a Python list of subreddits that we are interested in. If the Reddit comment is not in one of those subreddits, it is skipped.
+
+For tidiness, a function to create the path to the two output CSV files is useful.
+
+```{python}
+# given source file with reddit comment data, return path to CSV file with stylometry features
+def savefile(sourcefile, metadata = False):
+	return sourcefile.replace(".bz2", "_metadata.csv") if metadata else sourcefile.replace(".bz2", "_features.csv")
+
+```
+
+
+## Extracting metadata
+
+The extracted metadata will be saved in a CSV file with columns like below:
+
+```{r eval = TRUE, message = FALSE, warning=FALSE}
+#r code
+library(tidyverse)
+metadata <- read_csv("../Data/RC_2017-02_metadata.csv",
+                     col_types = "cccciiciiiiic")
+knitr::kable(metadata[1:10,])
+```
+
+
+Extracting the metadata is fairly straightforward--read in each line as a `json` object, then directly save the relevant `key, value` pairs to our CSV output file. If we use a [`csv.DictWriter`](https://docs.python.org/3/library/csv.html#csv.DictWriter) this process is made very simple. 
+
+
+```{python}
+import json 
+import csv 
+import bz2 #to read through a bz2 zipped file 
+
+def extract_metadata(sourcefile, subreddits = None):
+	#create path to CSV output file for metadata
+	metafile = open(savefile(sourcefile, metadata = True), 'w')
+	
+	#define columns that will be in the CSV file
+	metacolumns = ['id', 'subreddit_id', 'subreddit', 'author', 'created_utc', 'retrieved_on', 'parent_id', 'score', 'gilded', 'edited']
+	#use the same names for the columns as are in the Reddit json keys
+
+	#create CSV DictWriter
+	#this allows us to pass values as an unordered dict as in 
+	#{colname1: valueforcol1, colname2: valueforcol2, etc}
+	mwriter = csv.DictWriter(metafile, fieldnames = metacolumns)
+	mwriter.writeheader()
+	
+	#Open .bz2 file with JSON data and process line-by-line
+	with bz2.open(sourcefile, 'rt') as f: #'rt' specifies "read as text" rather than binary
+		for line in f:
+			comment = line.split('\n')[0] #get rid of extra \n at end
+			comment = json.loads(comment) #load comment as JSON
+			if subreddits is not None: 
+			#if subreddits are provided, filter for comments within the subreddits
+				if comment['subreddit'].lower() not in subreddits:
+					continue
+			if comment['author'] == "[deleted]": 
+				#"[deleted]" is reserved for users who delete their accounts
+				continue 
+			#create a new dict that contains only key, value pairs whose key is in metacolumns 
+			mwriter.writerow({key: value for key, value in comment.items() if key in metacolumns})
+```
+
+
+## Extracting textual features
+
+The process for extracting textual features is much the same, but with more massaging to create the features and make sure column names don't overlap. 
+
+The CSV file for textual features will look something like this (truncated to first 20 columns):
+
+```{r eval = TRUE,  message = FALSE, warning=FALSE}
+#r code
+library(tidyverse)
+library(kableExtra)
+features <- read_csv("../Data/RC_2017-02_features.csv")
+knitr::kable(features[1:10,], "html") %>%
+    kable_styling() %>%
+    scroll_box(width = "800px")
+```
+
+
+The beginning part of the function is essentially the same:
+
+```{python}
+import json
+import csv
+import bz2
+
+#additional functions we will need:
+from nltk.tokenize import RegexpTokenizer, word_tokenize #used to create features
+from string import ascii_lowercase, digits, punctuation #strings containing the aforementioned
+from string_utils import is_camel_case
+from numpy import arange #creates a python list sequence from 0 to n, given n
+from collections import Counter #to count the number of each feature
+from re import escape
+```
+
+Define column names for our output CSV file
+
+```{python}
+def extract_text_features(sourcefile, subreddits = None):
+    #read in a list of function words
+	function_words = set(open("../Data/function_words.txt", 'r').read().split('\n'))
+    
+    #create column names for CSV file
+    #many of these pull double duty as the column names and the actual features
+	fw_colnames = list(map(lambda x: "fw_{}".format(x), function_words))
+	chars = list(ascii_lowercase)
+	digs = list(digits)
+	punct = list(punctuation) #
+	othercols = ['id', 'author', 'subreddit', 'length_char', 'length_words', 'yules_k', 
+		'lego_1', 'lego_2', 'lego_3', 'lego_4', 'lego_5', 'lego_6', 'lego_7', 'lego_8', 'lego_9', 'lego_10p', 
+		'all_upper', 'all_lower', 'first_upper', 'camel', 'other_case', 'word_1', 'word_2', 'word_3', 'word_4', 'word_5', 'word_6', 'word_7', 'word_8', 'word_9', 'word_10',
+		'word_11', 'word_12', 'word_13', 'word_14', 'word_15', 'word_16', 'word_17', 'word_18', 'word_19', 'word_20p'] 
+```
+
+
+Create path to output CSV file and the `csv.DictWriter()` object. Additionally create a custom tokenizer using regex outside of the line-by-line loop.
+
+```{python}
+	#prepare CSV file to save features to
+	featfile= open(savefile(sourcefile, metadata = False), 'w')
+	fwriter = csv.DictWriter(featfile, fieldnames = othercols + fw_colnames + chars + digs + punct)
+	fwriter.writeheader()
+
+	#create tokenizer to get # of a-z, 0-9, punctuation, and special characters in each comment
+	#specify which characters to extract using a regex
+	pregex = '[a-z0-9{}]'.format(escape(punctuation))
+	tokenizer = RegexpTokenizer(pregex)
+```
+
+Open `bz2` file, begin `for` loop to read line-by-line, and filter out any comments that are not in the subreddits of interest or have author "[deleted]".
+
+```{python}
+	with bz2.open(sourcefile, 'rt') as f: 
+		for line in f:
+			
+			comment = json.loads(line.split('\n')[0])  
+			if subreddits is not None:
+				if comment['subreddit'].lower() not in subreddits:
+					continue
+			if comment['author'] == "[deleted]":
+				continue
+```
+
+From here on, the rest of the code focuses on creating the features that will be saved. Many of the features we're creating will be based on word units--such as the lengths of the words, the number of words that appear 1-20 times, the number of words that are function words. So it is useful to create two Python lists: one with each word in the comment, and one with all of the words transformed to lower case.
+
+```{python}
+			#massage comment into useful forms
+			words = word_tokenize(comment['body'])
+			words = [word for word in words if word.isalnum()] #don't include punctuation
+			lower_words = [word.lower() for word in words] #transform to lower case
+			#this way of making lists is called a list comprehension
+```
+
+Now we're ready to create our features. Since most of our features are similar, they can be split into chunks and dealt with together (i.e. get the frequency of 'a' at the same time as the frequency of 'z'). I took two main approaches to this:
+
+- Create a Python list with the features in question, then use `collections.Counter()` to get the counts of each feature. `Counter()` objects are Python `dict`s with added functionality. Each unique object in the list passed to `Counter()` will become a key, and the value is the number of times that object appears.
+
+- Directly create a Python `dict` where the key is the feature name, and the value is the feature value. This was for features that can easily be extracted in one line.
+
+I then combined these all into one `rowdict`, which is passed to our `csv.DictWriter()` for our output file. 
+
+Taking each chunk of features one at a time, we first grab the low-hanging fruit and count character-level tokens and function words, using the custom tokenizer defined earlier and the `function_words` list.
+
+
+```{python}
+			#count character-level tokens and function words
+			cntr = Counter() 
+			cntr.update(tokenizer.tokenize(comment['body'].lower()))
+			#pull out function words from comment, and prepend "fw_" to them to match the column names
+			fwords = ["fw_{}".format(word) for word in lower_words if word in function_words] 
+			cntr.update(fwords)
+			#create our rowdict object, which will be passed to csv.DictWriter()
+			rowdict = {key: value for key, value in cntr.items()}
+```
+
+Count how many words of each length by creating a Python list that gives the length of each word in `words`. Prepend "word_" to each key to match the CSV column names, and add to `rowdict`. 
+
+```{python}
+			#count how many words of each length 
+			lencnt = Counter() 
+			lencnt.update([len(word) for word in words])
+			lencnt = {"word_{}".format(key): value for key, value in lencnt.items() if key < 20}
+			#we only count up to 20 characters, so fold all words with 20+ characters into 'word_20p'
+			lencnt['word_20p'] = len(words) - sum([value for key, value in lencnt.items() if int(key.split("_")[1]) < 20])
+			#update our rowdict object
+			rowdict.update(lencnt)
+```
+
+Some features, like the number of lowercase words, the number of total words, and so on, are easy to get directly in one line from the comment JSON. So we create a new `dict` that does just that.
+
+```{python}
+			#other features that are easily wrapped in single-line operations
+			otherfeat = { 
+			"length_char": len(comment['body']),
+			"length_words": len(words),
+			"all_lower": sum(map(lambda x: x.islower(), words)), #lambdas are anonymous, single-use functions
+			"all_upper": sum(map(lambda x: x.isupper(), words)),
+			"first_upper": sum(map(lambda x: x.istitle(), words)),
+			"camel": sum(map(lambda x: is_camel_case(x), words)),
+			'id': comment['id'],
+			'author': comment['author'],
+			'subreddit': comment['subreddit']
+			}
+			otherfeat["other_case"] = otherfeat["length_words"] - otherfeat["all_upper"] - otherfeat["all_lower"] - otherfeat["camel"]
+```
+
+We don't add `otherfeat` to our `rowdict` just yet because there is one more feature I'll add to it.
+
+The last set of features are the "vocabulary richness" features. These count the number of words that appear once, twice, and so on up to 10 times. They also calculate Yule's K, a formula for approximating the diversity of language in a piece of text [@yule2014statistical, @tanaka2015computational].  
+
+```{python}
+			timescnt = Counter() 
+			timescnt.update(lower_words) #for each word, get the number of times it appears
+			legocnt = Counter() #create a second Counter that counts the number of appearances
+			legocnt.update(timescnt.values())
+
+            #similar to before, prepend with `lego_` so it isn't confused with frequency of 1-9
+			legocnt = {'lego_{}'.format(key): value for key, value in legocnt.items()}
+			legocnt = {key: value for key, value in legocnt.items() if int(key.split('_')[1]) < 10}
+
+			#fold all words that appear 10 or more times into `lego_10p`
+			legocnt['lego_10p'] = len(timescnt.keys()) - sum([value for key, value in legocnt.items() if int(key.split('_')[1]) < 10])
+
+            #update our rowdict object
+			rowdict.update(legocnt)
+
+            #calculate yule's k using the defined legomena, add to `otherfeat`
+			otherfeat["yules_k"] = 10**4 * (-1/len(words) + 
+				sum(
+					map(
+						lambda m: legocnt['lego_{}'.format(m)] * (m/len(words))**2 if 'lego_{}'.format(m) in legocnt else 0, 
+						arange(max(timescnt.values())) + 1))) if len(words) > 0 else 0
+
+            #update `rowdict` with `otherfeat`
+			rowdict.update(otherfeat)
+```
+			
+
+Finally, write the row to the output CSV file. On Python 3.5+, we could have avoided creating the `rowdict` object and iteratively updating it, but the ACI is not currently on 3.5.
+
+
+```{python}			
+			# fwriter.writerow({**cntr, **lencnt, **otherfeat, **legocnt}) #for python 3.5 and above, doesn't work on ACI
+			fwriter.writerow(rowdict)
+```
+
+
+## Running on ACI
+
+To run on the ACI, I added at the bottom of the Python script an "if main" statement, which runs the code below inside it if the script is called from the shell using `python script_name.py arg1 arg2 arg3 ...`. Arguments to the script are passed by adding them after the script's name, and are extracted within the `if __name__ == '__main__'` statement using `sys.argv`, which is a Python list of all arguments to the `python` call, including the script's name.
+
+The script assumes `arg1` is the path to the source data file, while the remaining arguments are subreddit names.
+
+```{python}
+if __name__ == '__main__':
+	subreddits = sys.argv[2:] if len(sys.argv) > 2 else None
+	extract_metadata(sys.argv[1], subreddits) #sys.argv[1] is the filename
+	extract_text_features(sys.argv[1], subreddits)
+```
+
+
+Then I create the PBS script which calls the Python file and provides it with the subreddits I'm interested in.
+
+```{bash}
+#!/bin/bash
+#PBS -l nodes=1:ppn=1
+#PBS -l walltime=24:00:00
+#PBS -l mem=1gb
+#PBS -M akz5056@psu.edu
+#PBS -m abe
+#PBS -A open
+
+cd $PBS_O_WORKDIR
+module load python
+python stylometry_features.py ../Data/RC_2017-02.bz2 nfl falcons patriots nflstreams nflnoobs
+```
+
+# Feature EDA
+
+Main goals:
+
+- Look for any odd inconsistencies in features
+
+- Look for how "informative" a feature is
+
+    - Calculate information gain for all features
+    
+    - Plot feature distribution of feature across authors and subreddits
+
+This is all done in R.
+
+![Example of feature distribution plot](../Output/EDA_subreddits_lego_1.png)
+
+
+## Read in data and pull out comments of interest
+
+I want the EDA to follow our research question, so I want to compare all of our features to those that are in our training set, and only use authors in the training set. For now the training set is the subreddit `/r/NFL`.
+
+I use the [tidyverse](https://www.tidyverse.org) and, in particular, [dplyr](http://dplyr.tidyverse.org/articles/dplyr.html) very heavily. It makes coding in R much smoother.
+
+```{r}
+#the ACI doesn't recognize the "tidyverse" wrapper package so load each package separately
+library(readr)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(magrittr)
+library(binr)
+
+file <- "../Data/RC_2017-02" #hardcode file we're using because I was being lazy
+allowed_gap <- 60*60*24*3 #comment scores are considered reliable if the comment was collected after allowed_gap
+
+main_subreddit <- "nfl" #set training subreddit
+options(tibble.print_max = Inf) 
+```
+
+Read in the metadata, and filter out authors that
+
+- did not post in the main subreddit `/r/NFL`
+
+- did not post in at least two of the subreddits in the metadata file
+
+I then save these to a CSV file, mostly as a just-in-case measure.
+
+```{r}
+metadata <- read_csv(paste0(file, "_metadata.csv"),
+                     col_types = "cccciiciiiiic") 
+
+subreddits <- unique(metadata$subreddit)
+
+#ID authors that are in the main subreddit and at least one of the others
+authors <- metadata %>%
+    group_by(author) %>%
+    summarise(
+        in_main = main_subreddit %in% subreddit,
+        in_others = any(setdiff(subreddits, main_subreddit) %in% subreddit),
+        subreddits = paste(unique(subreddit), collapse = " "), #record which subreddits
+        n_posts = n() #record total number of posts
+    ) %>%
+    filter(in_main, in_others) %>%
+    arrange(desc(n_posts)) %T>% # %T>% returns the object to the left of the pipe
+    write_csv(paste0(file, "_shared_authors.csv"))
+
+#filter metadata so it only contains the ID'ed authors
+metadata <- filter(metadata, author %in% authors$author)
+```
+
+Then read in the `features` CSV file and filter so that it contains only the comments that are also in the `metadata` dataframe.
+
+```{r}
+features <- read_csv(paste0(file, "_features.csv")) %>%
+    filter(id %in% metadata$id) 
+```
+
+We're going to be looping over all of the features very frequently, so it's useful to separate feature columns in the features dataframe from metadata columns.
+
+```{r}
+id_cols <- c("id", "subreddit_id", "author", "plot", "subreddit")
+feature_cols <- colnames(features) %>% setdiff(id_cols)
+```
+
+For simplicity when creating the `features` CSV file, I left features empty instead of setting them to 0. So now it's time to add the 0s back in. 
+
+```{r}
+#replace all NAs in feature_cols with 0s
+#replace_na() function requires a list where the name is the column and value is what
+#to replace NA values with. So first create the list
+toreplace <- setNames(lapply(vector("list", length(feature_cols)), 
+    function(x) x <- 0), feature_cols)
+#call replace_na
+features <- features %>% 
+    replace_na(toreplace) 
+```
+
+## Calculate information gain of features
+
+Information gain (IG) is defined as 
+
+$$ IG(F_i) = H(B) - H(B|F_i) = H(B) + H(F_i) - H(B,F_i) $$
+
+where $$H(A,B) = - \sum_{\omega} p_{\omega} \log_2{p_{\omega}}$$
+
+- $$\omega = \{ab: a \in A, b \in B\}$$
+
+- $$p_{\omega} = \text{prob of } \omega \text{ occurring}$$
+
+[@lin1991divergence, @narayanan2012feasibility]
+
+Realistically we would only have information gain over our training set. So create a separate dataframe that is our training set (and to make things easier later, create a new column called `plot` that is an indicator for whether that row will be plotted in the EDA later).
+
+```{r}
+plotprob <- min(30000/nrow(metadata), 1) #maximum number of points that can reasonably be plotted
+message("% of points that will be plotted is", plotprob, "\n")
+
+training_set <- features %>% 
+    filter(subreddit %in% main_subreddit) %>%
+    group_by(author) %>%
+    mutate(
+        plot = rbinom(1, n(), plotprob)
+    ) %>%
+    ungroup()
+
+features <- features %>%
+mutate(
+    plot = rbinom(1, n(), plotprob)
+    )
+```
+
+Define functions to help calculate information gain across all 100+ features.
+
+- `shannon_bin`: given the column index of the feature, `ftidx`, within the dataframe `df`, create an ordinal categorical variable with at most 20 bins. Return the categorical variable along with the `id` column in the dataframe. 
+
+- `shannon_entropy`: Given a vector containing instances of a categorical variable, calculate the Shannon entropy.
+
+- `info_gain`: Given the column index of the feature, `ftidx`, within the dataframe `df`, calculate information gain using `shannon_bin` and `shannon_entropy`.
+
+```{r}
+
+shannon_bin <- function(ftidx, df) {
+    ft <- as.numeric(df %>% pull(ftidx)) #pull returns a vector instead of a tibble
+    if (length(unique(ft)) == 1) return(df %>% select(id, ftidx))
+
+    bins <-  bins(ft, 20, max.breaks = 20) #create bins
+    newdf <- df %>% select(ftidx, id) %>% #rearranging df by the feature
+        arrange(df[[ftidx]]) %>%
+        mutate(bin = NA) %>%
+        select(-1) 
+    
+    #given number of items in each bin, assign bins
+    j = 0 
+    letter = 1
+    for (i in bins$binct) {
+        newdf$bin[j:(j+i)] <- letters[letter] 
+        letter <- letter + 1; j <- j + i
+    }
+
+    colnames(newdf)[2] <- colnames(df)[ftidx] #rename ordinal categorical variable to same as feature
+    return(newdf)
+}
+
+shannon_entropy <- function(fct) {
+    occurrence <- table(fct) + .01
+    prob <- occurrence/sum(occurrence)
+    - sum(prob * log2(prob))
+}
+
+#Takes: Dataframe and the column index of the feature of interest within the dataframe
+#Calculates information gain across authors, so it needs a group column named 'author'
+#Tbl manipulation means an 'id' column so that we can match numbers together is necessary
+#returns: scalar value of information gain for that column
+info_gain <- function(ftidx, df) {
+    fctorized <- shannon_bin(ftidx, df) %>%
+        full_join(df %>% select(author, id), by = "id") 
+
+    shannon_entropy(fctorized %>% pull(2)) + 
+    shannon_entropy(fctorized %>% pull(author)) -
+    shannon_entropy(interaction(fctorized %>% pull(2), fctorized %>% pull(author)))
+}
+```
+
+Then we loop over all feature columns, calculate their information gain, and store the results in a dataframe. The dataframe is saved to a CSV file, again as a just-in-case measure.
+
+```{r}
+message("Calculating information gain of feature in column 'x' of the training subreddit: \n")
+#calculate information gain for all columns specified as feature_cols, save as CSV file 
+feature_infogain <- tibble(
+    idx = which(colnames(training_set) %in% feature_cols),
+    info_gain = map_dbl(idx, function(ftidx) info_gain(ftidx, training_set)),
+    feature = feature_cols[idx],
+    n_unique = map_dbl(idx, function(ftidx) features %>% pull(ftidx) %>% unique %>% length)
+    )  %>%
+    arrange(desc(info_gain)) %T>%
+    write_csv(paste0(file, "_feature_infogain.csv"))
+```
+
+## Plot graphs
+
+To make the graphs neater, for each feature graph, sort the authors based on the average value of that feature within their comments. Then we first need to create a dataframe with average feature values across authors.
+
+
+```{r}
+#------------------------------EDA
+#compare feature distribution across authors, and across subreddits
+#provides support that features help distinguish authors and also transfer across subreddits
+
+#dataframe that calculates mean value of all feature_cols, grouped by author
+authorsumm <- training_set %>% 
+    group_by(author) %>%
+    summarise_at(feature_cols, mean, na.rm = TRUE) %>%
+    ungroup()
+
+```
+
+Loop across features and plot comparison of distribution of features across authors and subreddits. This helps us investigate whether the features are topic-independent in our dataset.
+
+```{r}
+for (i in 1:20) { 
+    #save plots of the top 20 features according to information gain
+    message(i) #in case an error occurs, easy way to know which feature is causing the error
+    ft <- feature_infogain$feature[i]
+  
+    #sort authors so they are in ascending order based on their mean valuefor feature of interest
+    #create index for the authors called `order` 
+    authorsumm <- authorsumm %>% arrange_(ft) %>% mutate(order = 1:n())
+ 
+    #merge `order` index with features df so authors are plotted in the correct order
+    features <- features %>% left_join(authorsumm %>% select(author, order), by = "author")
+    
+    #calculate average feature value for authors in other subreddits
+    subredditsumm <- features %>%
+        group_by(author, subreddit, order) %>%
+        summarise_at(feature_cols, mean, na.rm = TRUE) %>%
+        ungroup()
+
+    #plot
+    ggplot() +
+        #plot values of feature indicated by `plot` column
+        geom_point(data = features %>% filter(plot != 0), 
+            aes_string(x = "order", y = ft),
+                   alpha = 0.1, size = 1) +
+        #plot gold line that gives average value of feature in training set
+        geom_line(data = subredditsumm, aes_string(x = "order", y = ft),
+                  color = "#0980B2",  size = 0.8) +
+        #plot blue line that gives average value of feature in other subreddits
+        geom_line(data = authorsumm, aes_string(x = "order", y = ft),
+                  color = "#C4A20A", size = 0.8) +
+        theme_minimal() +
+        labs(title = paste("Distribution of", ft, "across subreddits and users"),
+             xlab = "Reddit user id #",
+             ylab = ft) +
+        #split plot into subreddits
+        facet_grid(subreddit ~ ., scales = "free_y") +
+        #save to `Output` folder
+        ggsave(paste0("../Output/EDA_subreddits_", ft, ".png"),
+            height = 10, width = 7, units = "in")
+
+    # clean-up, since we merge on `order` in each loop, need to remove `order` at the end  of every loop
+    features <- features %>% select(-order)
+}
+```
+
+
+## Running on ACI
+
+```{bash}
+#!/bin/bash
+#PBS -l nodes=1:ppn=1
+#PBS -l walltime=24:00:00
+#PBS -l mem=1gb
+#PBS -M akz5056@psu.edu
+#PBS -m abe
+#PBS -A open
+
+cd $PBS_O_WORKDIR
+module load r/3.4
+R CMD BATCH feature_EDA.R
+```
+
+
+# Settings for this R Markdown file
+
+
+```{YAML}
+---
+title: "Code overview"
+author: "Amy Zhang"
+date: "10/25/2017"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: zenburn 
+bibliography: axz_codebib.bib
+---
+```
+
+
+# References
