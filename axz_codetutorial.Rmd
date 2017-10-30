@@ -145,7 +145,7 @@ The CSV file for textual features will look something like this (truncated to fi
 #r code
 library(tidyverse)
 library(kableExtra)
-features <- read_csv("RC_2017-02_features.csv")
+features <- read_csv("RC_2017-02_features_first1e5.csv")
 knitr::kable(features[1:10,], "html") %>%
     kable_styling() %>%
     scroll_box(width = "800px")
